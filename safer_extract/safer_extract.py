@@ -1,26 +1,28 @@
 #!/bin/env python3
 from sys import argv, stdout
-from os import makedirs, sep, walk
-from subprocess import DEVNULL, run, CalledProcessError, STDOUT, PIPE, DEVNULL
+from os import execl, makedirs, readlink, sep, walk
+from subprocess import Popen, DEVNULL, run, TimeoutExpired, CalledProcessError, STDOUT, PIPE, DEVNULL
 from mimetypes import guess_extension, guess_type
 from pathlib import Path
 from typing import Optional, Union, Tuple
 from os.path import expanduser, dirname
 import unicodedata
 import logging
+from asyncio.protocols import DatagramProtocol
+import pexpect
 
 log = logging.getLogger()
 log.setLevel(logging.DEBUG)
 
-FAIL_SOUND = expanduser(
-    "~/Music/sfx/242503__gabrielaraujo__failure-wrong-action.wav"
-)
-WARNING_SOUND = expanduser(
-    "~/Music/sfx/350860__cabled-mess__blip-c-07.wav"
-)
-SUCCESS_SOUND = expanduser(
-    "~/Music/sfx/256113_3263906-lq.ogg"
-)
+SFX = {
+    "FAILED": expanduser(
+        "~/Music/sfx/242503__gabrielaraujo__failure-wrong-action.wav"),
+    "WARNING": expanduser(
+        "~/Music/sfx/350860__cabled-mess__blip-c-07.wav"),
+    "SUCCESS": expanduser(
+        "~/Music/sfx/256113_3263906-lq.ogg")
+}
+
 # Maximum number of bytes/chars in a filename
 MAX_NAME_LEN = 255
 
@@ -36,16 +38,20 @@ extractors = {
         [
             "unrar", "x",
             #"-or",  # rename files if name already taken
+            # "-ad", # prepend archive name to output directory
             "-o-",  # DEBUG don't overwrite
-            "-kb", "-c-", "-p-", "-ierr",
+            # "-kb", # keep broken files 
+            "-c-", # don't display comment
+            # "-p-", # don't prompt for password
+            # "-ierr", # send all messages to stderr
             "-x'*.txt'", "--",
             "##TARGET##", "##DESTDIR##"
         ],
         [
-            "unrar", "lb", "##TARGET##"
+            "unrar", "lb", "-p-", "##TARGET##"
         ],
         [
-            "unrar", "-inul", "p", "-o+", "##TARGET##", "##PROBFILE##"
+            "unrar", "p", "-inul", "-o+", "##TARGET##", "##PROBFILE##"
         ]
     ],
     "7z": [
@@ -121,17 +127,96 @@ def get_file_ext(filepath: Path) -> Optional[str]:
         _ext = guess_extension(mimetype[0])
     return _ext
 
+class CanceledPasswordPrompt(Exception):
+    pass
 
 def run_subproc(cmd: list) -> None:
-    proc = run(
-        cmd,
-        check=True,
-        capture_output=True,
-        # stdin=PIPE, stdout=PIPE, stderr=STDOUT,
-        text=True
-    )
-    log.debug(f"stderr: {proc.stderr}")
-    log.debug(f"stdout: {proc.stdout}")
+    # has_password = False
+
+    child = pexpect.spawn(cmd[0], args=cmd[1:], encoding='utf-8')
+    print(f"pexpect spawned: {child.command} {child.args}")
+    child.logfile = stdout
+    while True:
+        match = child.expect(["Enter password.*", "The specified password is incorrect", pexpect.EOF])
+        if match == 0:
+            # has_password = True
+            print("Password prompt detected, enter pw!")
+            pw = run_zenity()
+            if not pw:  # clicked cancel
+                raise CanceledPasswordPrompt
+            else:
+                child.sendline(pw)
+                continue
+        if match == 1:
+            play_sound("WARNING")
+            continue
+        if match == 2:
+            child.close()
+            print(f"Exit status: {child.exitstatus} signal: {child.signalstatus}")
+
+        break
+
+
+    # p = Popen(cmd,
+    #     bufsize=1,
+    #     # stdin=PIPE,
+    #     stderr=PIPE,
+    #     stdout=PIPE,
+    #     text=True,
+    # )
+
+    # while (line := p.stderr.readline()):
+    # while True:
+    #     # if line := p.stderr.readline():
+    #     #     print(f"line: {line}")
+    #     print(f"line {p.stderr.readline()}")
+    #     if "password" in p.stderr.readline():
+    #         print("found password!!!!!")
+    #     ret = p.poll()
+    #     if ret is None:
+    #         continue
+    #     else: 
+    #         break
+    # p.wait(timeout=5)
+
+    # try:
+    #     outs, errs = p.communicate(timeout=5)
+    #     print(f"out err: {errs}")
+    # except TimeoutExpired as e:
+    #     print(f"timout {e}")
+    #     p.kill()
+    #     outs, errs = p.communicate()
+    #     print(f"except {errs}")
+
+    # p.wait(5)
+    # p.communicate("mahpassword")[0].rstrip()
+
+    #     p.wait(timeout=5)
+    #     # out, err = p.communicate(timeout=15)
+    #     log.debug(f"stderr: {p.stderr}")
+    #     log.debug(f"stdout: {p.stdout}")
+
+
+def run_zenity():
+    # TODO display archive name in dialog
+    cmd = [
+        "zenity", "--password", "--title", 
+        "Safe Extract password prompt"
+    ]
+    data = None
+    try:
+        proc = run(cmd, check=True, capture_output=True, text=True)
+        data = proc.stdout
+    except CalledProcessError as e:
+        if e.returncode == 1: # clicked cancel
+            data = None
+        else:
+            raise
+    except Exception as e:
+        print(f"zenity exc: {e}")
+
+    print(f"zenity reutrned {data}")
+    return data
 
 
 def get_dest_dir(filepath: Path) -> Path:
@@ -146,15 +231,19 @@ def get_dest_dir(filepath: Path) -> Path:
     return candidate
 
 
-def play_sound(snd_path: Union[Path, str] ) -> None:
-    if isinstance(snd_path, str):
-        snd_path = Path(snd_path)
-        if not snd_path.exists():
-            return
-    log.debug(f"Playing sound {snd_path}")
+def play_sound(key: str) -> None:
+    """snd_path is a key in SFX dict."""
+    snd_pathstr = SFX.get(key, None)
+    if not snd_pathstr:
+        # invalid key
+        return
+
+    snd_path = Path(snd_pathstr)
+    if not snd_path.exists():
+        # File specified does not exist on disk
+        print(f"NOTIFICATION: {key}")
+        return
     run(['paplay', str(snd_path)])
-    # if "242503__gabrielaraujo__failure" in str(snd_path):
-    #     raise Exception("BOOOOH")
 
 
 def log_to_file(logpath: Path, message: str) -> None:
@@ -306,9 +395,9 @@ def main() -> None:
             log.debug(f"Calling extractor cmd: {cmd}")
             try:
                 run_subproc(cmd)
-                # pass
-            except CalledProcessError as e:
-                play_sound(WARNING_SOUND)
+            # except CalledProcessError as e:
+            except pexpect.ExceptionPexpect as e:
+                play_sound("WARNING")
                 log.info(f"{e.cmd} returned exit code: {e.returncode}")
                 log.info(f"{e.cmd} stderr: {e.stderr}")
                 if e.returncode == 9 and extractor == "unrar":
@@ -319,22 +408,30 @@ def main() -> None:
                     except Exception as e:
                         log.exception(
                             f"Failed to extract problematic filenames: {e}")
-                        play_sound(FAIL_SOUND)
+                        play_sound("FAILED")
                         continue
-                    play_sound(SUCCESS_SOUND)
+                    play_sound("SUCCESS")
                     break
+                continue
+            except CanceledPasswordPrompt:
+                log.warning(f"Canceled password for archive \"{filepath}\"")
+                play_sound("FAILED")
                 continue
             except Exception as e:
                 log.warning(f"Unhandled subprocess error running {cmd}: {e}")
-                play_sound(FAIL_SOUND)
+                play_sound("FAILED")
                 continue
-            # TODO make a resolved or "phew" sfx
-            play_sound(SUCCESS_SOUND)
+            # TODO make a "resolved" sfx
+            play_sound("SUCCESS")
             # No need to use other candidate extractors
             break
 
         if used_unreliable_prog:
-            diff, miss = check_extracted_files(filepath, destdir, _ext)
+            diff = 0
+            try:
+                diff, miss = check_extracted_files(filepath, destdir, _ext)
+            except Exception as e:
+                log.warning("Failed to compare files exracted to files in archives!")
             if diff != 0:
                 missing_fmt = '\n'.join('"' + f + '"' for f in miss)
                 log.warning(
@@ -344,7 +441,7 @@ def main() -> None:
                 )
     if extractor is None:
         log.warning("No extractor was used! Install one at least!")
-        play_sound(FAIL_SOUND)
+        play_sound("SUCCESS")
         return
 
 
@@ -411,23 +508,28 @@ def list_files_from_archive(
     gen = cmd_generator(filepath, destdir, ext, subcmd=1)
     ar_file_listing = []
     used_prog = None
-    for p in gen:
-        log.debug(f"Calling extractor subcommand: {p}")
+    for cmd in gen:
+        log.debug(f"Calling extractor subcommand: {cmd}")
         try:
             proc = run(
-                p,
+                cmd,
                 check=True,
                 capture_output=True,
                 # stdin=PIPE, stdout=PIPE, stderr=STDOUT,
                 text=True
             )
         except Exception as e:
-            log.debug(f"Unhandled error running extractor subcommand {p}: {e}")
+            log.debug(f"Unhandled error running extractor subcommand {cmd}: {e}")
             continue
-        used_prog = p[0]
+        used_prog = cmd[0]
         # FIXME depends on the program used
         if used_prog == "unrar":
             for line in proc.stdout.split("\n"):
+                # filenames are crypted in this rar file
+                if "Incorrect password for" in line:
+                    # TODO ask for password again here?
+                    raise Exception
+
                 stripped = line.strip()
                 if stripped:
                     ar_file_listing.append(stripped)
