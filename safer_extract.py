@@ -103,7 +103,10 @@ def main() -> None:
                     "after extraction, or they had to be renamed slightly: "
                     f"{fs_missing_files}"
                 )
-
+            else:
+                log.debug(
+                    "Number of files on disk matches number of files "
+                    f"reported in archive by extractor {arfile.handler}")
 def enumerate_extracted_files( 
     destdir: Path,
     ) -> list[ArchiveEntry]:

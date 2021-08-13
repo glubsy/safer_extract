@@ -22,15 +22,15 @@ log = logging.getLogger()
 
 # The order matter for ranking
 ext_to_extractor = {
-    ".rar": [UnrarHandler, SevenZHandler, ArkHandler],
-    ".zip": [SevenZHandler, UnzipHandler, ArkHandler],
+    ".rar": [UnrarHandler, SevenZHandler, ArkHandler, UnpHandler],
+    ".zip": [SevenZHandler, UnzipHandler, ArkHandler, UnpHandler],
     "*": [UnpHandler, ArkHandler]
 }
 
 ext_to_mime = {
     ".rar": ["application/x-rar", "application/vnd.rar"],
     ".zip": ["application/zip", "application/gzip", "application/vnd.comicbook+zip"],
-    ".7z": ["application/x-7z-compressed"]
+    ".7z": ["application/x-7z-compressed"],
 }
 
 
@@ -142,14 +142,17 @@ class File():
         create_subdir: bool = True,
         exclude: list[str] = None
     ) -> None:
+
+        self.dest_dir = get_dest_dir(self.path, dest_dir, create_subdir)
+
         while True:
             if self.handler is ArkHandler:
                 self._used_unreliable = True
             log.debug(f"Calling extractor: {self.handler}")
             try:
-                self.dest_dir, self.password = self.handler.extract_files(
+                self.password = self.handler.extract_files(
                     target=self.path,
-                    dest_dir=dest_dir,
+                    dest_dir=self.dest_dir,
                     create_subdir=create_subdir,
                     exclude=exclude
                 )
@@ -157,10 +160,11 @@ class File():
             except FileCreationError as e:
                 # if not e.problematic_filenames:
                 # TODO get bad filenames by other means (-test flag) if empty
-                log.debug(f"Problematic filenames found: "
-                        f"{len(e.problematic_filenames)}. "
-                        f"{e.problematic_filenames}"
-                        )
+                log.debug(
+                    f"Problematic filenames found: "
+                    f"{len(e.problematic_filenames)}. "
+                    f"{e.problematic_filenames}"
+                )
                 self.password = e.password
                 for pfile in e.problematic_filenames:
                     if pfile.error == UnrarErrorCode.NOT_A_DIR.value:

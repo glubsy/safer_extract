@@ -13,26 +13,33 @@ def get_dest_dir(filepath: Path,
                  dest_dir: Optional[Path], 
                  create_subdir: bool = True) -> Path:
     """Return the directory where the archive should be expanded into."""
-    if not dest_dir:
+    custom = False
+    if dest_dir is None:
         # by default, use the directory holding this file
         dest_dir = filepath.absolute().parent
+    else:
+        custom = True
+        dest_dir = dest_dir.absolute()
+
     if create_subdir:
-        # /path/to/blahfile.meh.rar will extract to /path/to/blah
-        dest_dir = dest_dir.absolute().parent / dest_dir.stem
+        # /path/to/blahfile.meh.rar will extract to /path/to/custom/blahfile
+        dest_dir = dest_dir / filepath.stem
 
-        if dest_dir.exists() and dest_dir.is_file():
-            # Fall back
-            dest_dir = dest_dir / (filepath.name + ".d")
+        if dest_dir.is_file():
+            dest_dir = dest_dir.with_suffix(".d")
 
-    num = 0
-    while dest_dir.exists() and dest_dir.is_file:
-        dest_dir = dest_dir / f"_{num}"
+    # Append number to stem to avoid the existing file
+    num = 1
+    while dest_dir.is_file():
+        dest_dir = dest_dir.parent / (
+            dest_dir.stem + "_##num##" + dest_dir.suffix
+        ).replace("##num##", str(num)) 
         num += 1
         if num > 10:
             log.debug("Too many attempts at renaming destination directory.")
             break
 
-    if dest_dir.exists() and dest_dir.is_file():
+    if dest_dir.is_file():
         log.warning(
             f"{dest_dir} already existed and is a file, not a directory! "
             f"Will not create subdirectory during extraction!")

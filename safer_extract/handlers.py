@@ -168,7 +168,6 @@ def replace_cmd(template: list, *replacements: tuple[str, Any]) -> list:
                 cmd[idx] = item.replace(replace[0], str(replace[1]))
     for item in to_remove:
         cmd.remove(item)
-    log.debug(f"Replaced command {cmd}")
     return cmd
 
 
@@ -181,13 +180,12 @@ class Handler():
         dest_dir: Union[Path, None] = None,
         create_subdir: bool = True,
         exclude: list[str] = None
-    ) -> tuple[Path, Union[str, None]]:
+    ) -> Optional[str]:
         """Extract files from archive.
         :param target: archive file from which to extract
         :param dest_dir: destination directory where to extract files
         :param create_subdir: whether or not to create a subdirectory to extract
-        :return (path, password): path of destination directory if successfully 
-        created, and the last used valid password if any.
+        :return: the last used valid password if any.
         """
         raise NotImplementedError
 
@@ -262,7 +260,7 @@ class UnrarHandler(Handler):
         dest_dir: Union[Path, None] = None,
         create_subdir: bool = True,
         exclude: list[str] = None
-    )-> tuple[Path, Union[str, None]]:
+    ) -> Optional[str]:
 
         cmd = replace_cmd(
             cls.ecmd, 
@@ -280,14 +278,15 @@ class UnrarHandler(Handler):
         # we don't use it since we always specify a dest dir in File class,
         # as this is also prone to raise "Not a directory" errors, but just in case...
         unrar_dest_dir = target.absolute().parent / target.stem
-        if dest_dir is None or "##DESTDIR##" not in cmd:
+        if dest_dir is None and "##DESTDIR##" not in cmd:
             # unrar will use this path, and fail if that's a file, so we fall 
             # back to our own manual solution of creating a unique subdir
             if unrar_dest_dir.is_file():
-                log.debug("Destination is a file, unrar will not like...")
+                log.debug(f"Destination {unrar_dest_dir} is a file, unrar will not like...")
                 dest_dir = get_dest_dir(target, None, create_subdir)
                 log.debug(f"Will output to \"{dest_dir}\" instead.")
                 unrar_dest_dir = dest_dir
+                
                 cmd.append(str(dest_dir))
             else:
                 cmd.insert(3, "-ad")
@@ -337,7 +336,7 @@ class UnrarHandler(Handler):
             # TODO make custom exception, handle other errors better
             raise Exception
         
-        return dest_dir, last_pw
+        return last_pw
 
     @classmethod
     def list_files(
@@ -409,7 +408,7 @@ class UnrarHandler(Handler):
             for ex in exclude:
                 cmd.insert(2, f"-x'{ex}'")
         try:
-            cls.run_subproc2(
+            cls.run_subproc_print(
                 cmd, 
                 probfile=probfile, 
                 dest_dir=dest_path
@@ -477,7 +476,7 @@ class UnrarHandler(Handler):
         return _outputbuff, child.exitstatus, last_pw
 
     @staticmethod
-    def run_subproc2(
+    def run_subproc_print(
         cmd: list, 
         probfile: ArchiveEntry, 
         dest_dir: Path
@@ -525,7 +524,7 @@ class UnrarHandler(Handler):
                     # has_password = True
                     log.debug("Password prompt detected, enter pw!")
                 if match == 2:
-                    log.debug("EOFFFFFFFFFFFFFFFFFFFFFFFF"
+                    log.debug("EOF"
                     )
                     break
 
