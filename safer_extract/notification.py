@@ -18,6 +18,7 @@ SFX = {
 
 def play_sound(key: str) -> None:
     """snd_path is a key in SFX dict."""
+    log.warning(f"NOTIFICATION: {key}")
     snd_pathstr = SFX.get(key, None)
     if not snd_pathstr:
         # invalid key
@@ -25,7 +26,6 @@ def play_sound(key: str) -> None:
 
     snd_path = Path(snd_pathstr)
     if not snd_path.exists():
-        # File specified does not exist on disk
-        log.warning(f"NOTIFICATION: {key}")
+        # File specified does not exist on disk)
         return
     run(['paplay', str(snd_path)])

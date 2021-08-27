@@ -7,6 +7,12 @@ Front-end for various compressed archive file extractors.
 * Zenity
 * paplay
 * python-magic (optional)
+* unrar (optional)
+* python-unrar (optional)
+* unzip (optional)
+* unp (optional)
+* 7z (optional)
+* Ark (optional)
 
 # License
 

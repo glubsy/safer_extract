@@ -5,6 +5,7 @@ from enum import Enum
 from typing import Any, Optional, Union
 from subprocess import run, CalledProcessError, Popen, PIPE
 import logging
+log = logging.getLogger()
 import io
 import re
 
@@ -13,9 +14,7 @@ from pexpect import fdpexpect
 
 from safer_extract.notification import play_sound
 from .util import get_dest_dir, sanitized
-
-
-log = logging.getLogger()
+from .entry import ArchiveEntry
 
 
 def run_zenity() -> Optional[str]:
@@ -40,40 +39,7 @@ def run_zenity() -> Optional[str]:
     return data
 
 
-class ArchiveEntry():
-    """Describes a generic archive entry."""
-
-    __slots__ = ["name", "path", "error", "password"]
-
-    def __init__(
-        self, 
-        name: str, 
-        path_parts: Optional[list] = None
-    ) -> None:
-        # log.debug(f"ArchiveEntry({name}, {path_parts})")
-        self.name: str = name
-        self.path: Optional[str] = "/".join(path_parts) \
-                    if path_parts is not None and len(path_parts) > 0 \
-                    else None
-        self.error: Optional[str] = None
-        self.password: Optional[str] = None
-
-    def __hash__(self) -> int:
-        if self.path is not None:
-            return hash(self.path + "/" + self.name)
-        return hash(self.name)
-    
-    def __repr__(self) -> str:
-        if self.path is not None:
-            return self.path + "/" + self.name
-        return self.name
-    
-    def __eq__(self, other):
-        return (isinstance(other, type(self))
-                and hash(other) == hash(self))
-
-
-def parse_unrar_text_output(text_buffer: io.StringIO, 
+def parse_unrar_text_output(text_buffer: io.StringIO,
                             destdir: Path) -> set[ArchiveEntry]:
     """
     :param text_buffer: stderr output from unrar
@@ -87,7 +53,7 @@ def parse_unrar_text_output(text_buffer: io.StringIO,
     def get_file_path(line: str) -> list:
         """Return list of ['maybe/inner/path', 'filename']."""
         # Assuming path separators are always "/", which they should be.
-        # It's bad new if it's a "\", we will have the path inside the filename. 
+        # It's bad new if it's a "\", we will have the path inside the filename.
         splits = line.split("/")
         # log.debug(f"splits for \"{line}\": {splits}")
         filename = splits[-1]
@@ -133,25 +99,25 @@ def parse_unrar_text_output(text_buffer: io.StringIO,
                     entry.error = UnrarErrorCode.TOO_LONG.value
                 else:
                     problematic.add(entry)
-                                
+
         if "Total errors:" in line:
             if match := re.match(r".*Total errors: (\d*).*", line):
                 num_err = int(match.group(1))
             log.debug(f"Unrar reported {num_err} errors.")
-        
+
         cached_line = line
 
     if num_err != len(problematic):
         log.warning(
             f"Number of reported errors ({num_err}) does not match "
             f"the number of problematic files recorded ({len(problematic)})")
-    
+
     return problematic
 
 
 def replace_cmd(template: list, *replacements: tuple[str, Any]) -> list:
     """Return a copy of template with placeholders replaced by args specified
-    in each *args tuple. If the value is the tuple is None, the placeholder is 
+    in each *args tuple. If the value is the tuple is None, the placeholder is
     simply removed."""
     cmd = template[:]
     to_remove = set()
@@ -176,7 +142,7 @@ class Handler():
     @classmethod
     def extract_files(
         cls,
-        target: Path, 
+        target: Path,
         dest_dir: Union[Path, None] = None,
         create_subdir: bool = True,
         exclude: list[str] = None
@@ -191,8 +157,8 @@ class Handler():
 
     @classmethod
     def list_files(
-        cls, 
-        target: Path, 
+        cls,
+        target: Path,
         password: Optional[str] = None,
         exclude: list[str] = None
     ) -> list[ArchiveEntry]:
@@ -200,15 +166,22 @@ class Handler():
 
     @classmethod
     def print_file(
-        cls, 
-        target: Path, 
-        probfile: ArchiveEntry, 
+        cls,
+        target: Path,
+        probfile: ArchiveEntry,
         dest_path: Path,
         password: Optional[str] = None,
         exclude: list[str] = None
     ) -> None:
         raise NotImplementedError
 
+
+class PatoolHandler(Handler):
+    available = False
+
+
+class RarLibHandler(Handler):
+    available = False
 
 class UnrarExitCode(Enum):
     RARX_SUCCESS   =   0  # Successful operation.
@@ -255,38 +228,37 @@ class UnrarHandler(Handler):
 
     @classmethod
     def extract_files(
-        cls, 
-        target: Path, 
+        cls,
+        target: Path,
         dest_dir: Union[Path, None] = None,
         create_subdir: bool = True,
         exclude: list[str] = None
     ) -> Optional[str]:
 
         cmd = replace_cmd(
-            cls.ecmd, 
-            ("##TARGET##", target), 
+            cls.ecmd,
+            ("##TARGET##", target),
             ("##DESTDIR##", dest_dir)
         )
-
         if exclude:
             for ex in exclude:
                 cmd.insert(2, f"-x'{ex}'")
 
         log.debug(f"Command after replace: {cmd}")
-        
+
         # If destdir is None, use -ad flag (##DESTDIR## is removed). In practice
         # we don't use it since we always specify a dest dir in File class,
         # as this is also prone to raise "Not a directory" errors, but just in case...
-        unrar_dest_dir = target.absolute().parent / target.stem
+        expected_dest_dir = target.absolute().parent / target.stem
         if dest_dir is None and "##DESTDIR##" not in cmd:
-            # unrar will use this path, and fail if that's a file, so we fall 
-            # back to our own manual solution of creating a unique subdir
-            if unrar_dest_dir.is_file():
-                log.debug(f"Destination {unrar_dest_dir} is a file, unrar will not like...")
+            # The extractor will use this path, and fail if that's a file, so
+            # we fall back to our own manual solution of creating a unique subdir
+            if expected_dest_dir.is_file():
+                log.debug(f"Destination {expected_dest_dir} is a file, unrar will not like...")
                 dest_dir = get_dest_dir(target, None, create_subdir)
                 log.debug(f"Will output to \"{dest_dir}\" instead.")
-                unrar_dest_dir = dest_dir
-                
+                expected_dest_dir = dest_dir
+
                 cmd.append(str(dest_dir))
             else:
                 cmd.insert(3, "-ad")
@@ -294,8 +266,9 @@ class UnrarHandler(Handler):
         if dest_dir is not None:
             makedirs(dest_dir, exist_ok=True)
         elif dest_dir is None:
-            dest_dir = unrar_dest_dir
-            
+            # Don't make the directory, let the extractor create it.
+            dest_dir = expected_dest_dir
+
         exitcode = -1
         output: Optional[io.StringIO] = None
         last_pw = None
@@ -303,7 +276,7 @@ class UnrarHandler(Handler):
             output, exitcode, last_pw = cls.run_subproc(cmd)
         # except CalledProcessError as e:
         except pexpect.ExceptionPexpect as e:
-            log.exception(f"Pexcept exception: {e}")
+            log.exception(f"Pexpect exception: {e}")
 
         play_sound("WARNING")
 
@@ -335,52 +308,66 @@ class UnrarHandler(Handler):
             )
             # TODO make custom exception, handle other errors better
             raise Exception
-        
+
+        if output is not None:
+            output.close()
         return last_pw
 
     @classmethod
     def list_files(
-        cls, 
-        target: Path, 
+        cls,
+        target: Path,
         password: Optional[str] = None,
         exclude: list[str] = None
     ) -> list[ArchiveEntry]:
+        # FIXME Warning if the file requires a password, we won't prompt for it 
+        # and this handler might wait for it indefinitely!
+
         cmd = replace_cmd(
-            cls.lcmd, 
+            cls.lcmd,
             ("##TARGET##", target),
             ('##PASSWORD##', password)
         )
         if exclude:
             for ex in exclude:
                 cmd.insert(2, f"-x'{ex}'")
-        while True:
-            try:
-                proc = run(
-                    cmd,
-                    check=True,
-                    capture_output=True,
-                    # stdin=PIPE, stdout=PIPE, stderr=STDOUT,
-                    text=True,
-                )
-                return cls.parse_list_output(proc.stdout)
-            except Exception as e:
-                log.debug(f"Unhandled error running extractor subcommand {cmd}: {e}")
-                raise e
+        try:
+            proc = run(
+                cmd,
+                check=True,
+                capture_output=True,
+                # stdin=PIPE, stdout=PIPE, stderr=STDOUT,
+                text=True,
+            )
+            return cls.parse_list_output(proc.stdout)
+        except Exception as e:
+            log.debug(f"Unhandled error running extractor subcommand {cmd}: {e}")
+            raise e
 
     @staticmethod
     def parse_list_output(buffer: str) -> list[ArchiveEntry]:
         """Return list of entry files, but filter out the directory files."""
+        log.debug(f"OUTPUT TO PARSE: {buffer}")
         files_parts = []
         for line in buffer.split("\n"):
             stripped = line.rstrip()
-            if stripped.startswith((" ", "*")): 
-                # "*   ..A....      1220  2021-08-05 21:15  dir/file.ext"
-                # "    ...D...         0  2021-08-05 21:15  dir"
-                if match := re.match(r"\*?\s*(\S{7})\s*\d*\s{2}.*\s{2}(.*)", line):
+            # Hacky way of eliminating the header row
+            if stripped.startswith((" ", "*")) \
+            and "Attributes      Size" not in line:
+                # Archive made in Windows:
+                # *   ..A....      1220  2021-08-05 21:15  dir/file.ext
+                #     ...D...         0  2021-08-05 21:15  dir
+                #  -rw-r--r--       692  2021-06-11 11:22  file
+                # Archive made in Unix:
+                #  -rw-r--r--       692  2021-06-11 11:22  file
+                #  -rw-r--r--    105456  2021-06-11 11:22  dir/file
+                #  drwxr-xr-x         0  2021-08-17 04:02  empty_dir
+
+                if match := re.match(r"\*?\s*(\S{7}|\S{10})\s*\d*\s{2}.*\s{2}(.*)", line):
                     attrs = match.group(1)
                     entryname = match.group(2)
                     log.debug(f"attrs: {attrs} fname {entryname}")
-                    if "D" not in attrs:
+                    if "D" not in attrs.upper():
                         splits = entryname.split("/")
                         filename = splits[-1]
                         innerpath = splits[:-1]
@@ -390,17 +377,17 @@ class UnrarHandler(Handler):
 
     @classmethod
     def print_file(
-        cls, 
-        target: Path, 
-        probfile: ArchiveEntry, 
+        cls,
+        target: Path,
+        probfile: ArchiveEntry,
         dest_path: Path,
         password: Optional[str] = None,
         exclude: list[str] = None
     ) -> None:
         log.debug(f"print_file(): probfile: {probfile}, password {password}")
         cmd = replace_cmd(
-            cls.pcmd, 
-            ("##TARGET##", target), 
+            cls.pcmd,
+            ("##TARGET##", target),
             ("##PROBFILE##", probfile),
             ('##PASSWORD##', password)
         )
@@ -409,8 +396,8 @@ class UnrarHandler(Handler):
                 cmd.insert(2, f"-x'{ex}'")
         try:
             cls.run_subproc_print(
-                cmd, 
-                probfile=probfile, 
+                cmd,
+                probfile=probfile,
                 dest_dir=dest_path
             )
         except Exception as e:
@@ -458,7 +445,7 @@ class UnrarHandler(Handler):
                 play_sound("WARNING")
                 continue
             elif match == 2:
-                # TODO we could send Yes instead and record valid password for each 
+                # TODO we could send Yes instead and record valid password for each
                 # entry, which means we need to instanciate an appropriate
                 # ArchiveEntry for every entry needing a password
                 log.debug("Detected prompt to resend... Sending 'All'.")
@@ -473,24 +460,26 @@ class UnrarHandler(Handler):
             else:
                 log.debug("No expect match...")
                 continue
+        child.close()
         return _outputbuff, child.exitstatus, last_pw
 
     @staticmethod
     def run_subproc_print(
-        cmd: list, 
-        probfile: ArchiveEntry, 
+        cmd: list,
+        probfile: ArchiveEntry,
         dest_dir: Path
     ) -> None:
         newname = sanitized(probfile.name, isfile=True)
         log.critical(f"Renamed problematic file to {newname}")
+        probfile.updated_name = newname
 
         if probfile.path is not None:
             final_path = dest_dir / (probfile.path + sep + newname)
         else:
             final_path = dest_dir / newname
-        
+
         if final_path.is_file():
-            log.warning(f"File {final_path} already exists.")
+            log.warning(f"File {final_path} already exists. Skipping.")
             return
             # TODO if filename is 255 bytes long, overwrite with number
             # otherwise simply append to it.
@@ -503,49 +492,95 @@ class UnrarHandler(Handler):
             # log.warning(f"Will attempt to extract as {final_path}.")
 
         with open(final_path, "wb") as outfile:
-            command = Popen(
-                cmd, 
+            with Popen(
+                cmd,
                 stdout=outfile,
-                stdin=PIPE, 
+                stdin=PIPE,
                 stderr=PIPE
-            )
-            # FIXME we don't need all this
-            childin = fdpexpect.fdspawn(command.stdin)
-            childerr = fdpexpect.fdspawn(command.stderr)
-            while True:
-                match = childerr.expect(
-                    [
-                        "Enter password.*",
-                        "The specified password is incorrect",
-                        pexpect.EOF
-                    ]
-                )
-                if match == 0:
-                    # has_password = True
-                    log.debug("Password prompt detected, enter pw!")
-                if match == 2:
-                    log.debug("EOF"
+            ) as command:
+                # FIXME we don't need all this
+                # childin = fdpexpect.fdspawn(command.stdin)
+                childerr = fdpexpect.fdspawn(command.stderr)
+                while True:
+                    match = childerr.expect(
+                        [
+                            "Enter password.*",
+                            "The specified password is incorrect",
+                            pexpect.EOF
+                        ]
                     )
-                    break
+                    if match == 0:
+                        # has_password = True
+                        log.debug("Password prompt detected, enter pw!")
+                    if match == 2:
+                        log.debug("EOF"
+                        )
+                        break
+                # FIXME attempt to fix 
+                # ResourceWarning: subprocess 179071 is still runnin
+                # ResourceWarning: unclosed file <_io.BufferedWriter name=5>
+                # childerr.close()
+                
+                # command.wait()
+                # if command.stdout is not None:
+                #     command.stdout.close()
 
 
 class SevenZHandler(Handler):
     ecmd = [
         "7z", "x", "##TARGET##",
         # "-w", "##DESTDIR##", # change cwd
-        "-o*", # automatic create output directory
+        # "-o*", # automatic create output directory
         # "-o##DESTDIR##", # manual output directory
-        "-x!*.txt",  # exclude txt files
+        # "-x!*.txt",  # exclude txt files
+    ]
+    lcmd = [
+        "7z", "l", "##TARGET##",
+        # "-w", "##DESTDIR##", # change cwd
+        # "-o*", # automatic create output directory
+        # "-o##DESTDIR##", # manual output directory
+        # "-x!*.txt",  # exclude txt files
+    ]
+    pcmd = [
+        "7z", "x", "##TARGET##",
+        "-p##PASSWORD##",
+        "-so" # to stdout
+        # "-w", "##DESTDIR##", # change cwd
+        # "-o##DESTDIR##", # manual output directory
     ]
 
     @classmethod
-    def extract_files(cls, target: Path, destdir: Optional[Path] = None) -> None:
-        # TODO if no destdir, use -ad flag and remove ##DESTDIR##
+    def extract_files(
+        cls,
+        target: Path,
+        dest_dir: Union[Path, None] = None,
+        create_subdir: bool = True,
+        exclude: list[str] = None
+    ) -> Optional[str]:        # TODO if no destdir, use -ad flag and remove ##DESTDIR##
         cmd = replace_cmd(
             cls.ecmd,
-            ("##TARGET##", target), 
-            ("##DESTDIR##", destdir)
+            ("##TARGET##", target),
+            ("##DESTDIR##", dest_dir)
         )
+        if exclude:
+            for ex in exclude:
+                cmd.insert(2, f"-xr'!{ex}'")
+
+        log.debug(f"Command after replace: {cmd}")
+
+        expected_dest_dir = target.absolute().parent / target.stem
+        if dest_dir is None and "##DESTDIR##" not in cmd:
+            # unrar will use this path, and fail if that's a file, so we fall
+            # back to our own manual solution of creating a unique subdir
+            if expected_dest_dir.is_file():
+                log.debug(f"Destination {expected_dest_dir} is a file, unrar will not like...")
+                dest_dir = get_dest_dir(target, None, create_subdir)
+                log.debug(f"Will output to \"{dest_dir}\" instead.")
+                expected_dest_dir = dest_dir
+
+                cmd.append(str(dest_dir))
+            else:
+                cmd.insert(3, "-o'*'")
 
 
 class UnzipHandler(Handler):
@@ -566,8 +601,8 @@ class CanceledPasswordPrompt(Exception):
 
 class FileCreationError(Exception):
     def __init__(
-        self, 
-        args: object, 
+        self,
+        args: object,
         filelist: Union[list, set],
         dest_dir: Optional[Path] = None,
         password: Optional[str] = None

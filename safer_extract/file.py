@@ -1,31 +1,79 @@
-from typing import Generator, Optional, Any
+from typing import Generator, Optional
 from pathlib import Path
+from os import walk
 import logging
+log = logging.getLogger()
+from subprocess import DEVNULL, run
 from mimetypes import guess_extension, guess_type
 
 HAS_MAGIC = False
 try:
+    # This is either python-magic or file-magic (deprecated)
     import magic
     HAS_MAGIC = True
-except ImportError:
-    pass
+except ImportError as e:
+    log.warning(e)
 
 from .handlers import (
-    ArchiveEntry, UnrarHandler, SevenZHandler, UnzipHandler, ArkHandler, UnpHandler,
-    FileCreationError, CanceledPasswordPrompt, Handler
+    ArchiveEntry, UnrarHandler, SevenZHandler, UnzipHandler, ArkHandler, 
+    UnpHandler, FileCreationError, CanceledPasswordPrompt, Handler, 
+    RarLibHandler, PatoolHandler
 )
 from .notification import play_sound
 from .util import get_dest_dir
 from .handlers import UnrarErrorCode
 
-log = logging.getLogger()
 
 # The order matter for ranking
 ext_to_extractor = {
-    ".rar": [UnrarHandler, SevenZHandler, ArkHandler, UnpHandler],
-    ".zip": [SevenZHandler, UnzipHandler, ArkHandler, UnpHandler],
-    "*": [UnpHandler, ArkHandler]
+    ".rar": [UnrarHandler, RarLibHandler, SevenZHandler, ArkHandler, UnpHandler],
+    ".zip": [SevenZHandler, UnzipHandler, PatoolHandler, ArkHandler, UnpHandler],
+    "*": [PatoolHandler, UnpHandler, ArkHandler]
 }
+
+def update_available_tools():
+    """
+    Keep track of processes and libraries available on this system.
+    """
+    available_extractors = set()
+    for h_list in ext_to_extractor.values():
+        for h in h_list:
+            available_extractors.add(h)
+
+    log.debug(f"Initial extractors list {available_extractors}")
+
+    # Update list of available extractors on this system
+    missing = set()
+    for p in available_extractors:
+        if hasattr(p, "ecmd"):
+            log.debug(f"Checking if {p.ecmd[0]} is available...")
+            # Use the hardcoded commands to identify the program actually used
+            proc = run(
+                ['which', p.ecmd[0]], check=False,
+                capture_output=False, stdout=DEVNULL, stderr=DEVNULL
+            )
+            if not proc.returncode == 0:
+                log.debug(f"`which {p}` returned exit code {proc.returncode}")
+                missing.add(p)
+        elif hasattr(p, "available"):  # handler is a library wrapper
+            if not p.available:
+                missing.add(p)
+        else:
+            missing.add(p)
+
+    for miss in missing:
+        available_extractors.remove(miss)
+    log.info(f"Available extractors: {available_extractors}")
+
+    # update according to available
+    for key in ext_to_extractor.keys():
+        ext_to_extractor[key] = [
+            h for h in ext_to_extractor[key] if h in available_extractors
+        ]
+
+    log.debug(f"Extractors per extension {ext_to_extractor}")
+
+update_available_tools()
 
 ext_to_mime = {
     ".rar": ["application/x-rar", "application/vnd.rar"],
@@ -46,28 +94,29 @@ def get_ext(_mime: Optional[str]) -> Optional[str]:
 def get_mimetype(fpath: Path) -> tuple[Optional[str], Optional[str]]:
     if not HAS_MAGIC:
         return None, None
-    if hasattr(magic, "from_file"):
-        # We use "python-magic" package
-        m = magic.from_file(mime=True, uncompess=False, extension=True)
+    if hasattr(magic, "from_file"):  # We use "python-magic" package
+        m = magic.from_file(fpath, mime=True, uncompess=False, extension=True)
         mime = m.mime
         ext = "." + m.extension
-        return mime, ext
-        # 'application/x-rar'
-    else:
-        # We use "file-magic" package (upstream, but deprecated)
-        detected = magic.detect_from_filename(str(fpath))
+        log.debug(f"Using python-magic: {mime}, {ext}")
+        return mime, ext  # 'application/x-rar'
+    else:  # We use "file-magic" package (upstream, but deprecated)
+        # strict will raise if file is a symlink and can't be resolved
+        detected = magic.detect_from_filename(str(fpath.resolve(strict=True)))
         # mime_type='application/x-rar'
         log.debug(
             f"file-magic detected mime_type: \"{detected.mime_type}\" "
             f"name: \"{detected.name}\""
             )
         mime = detected.mime_type
+        log.debug(f"Using file-magic: {mime}, None")
         return mime, None
 
 
 class File():
     def __init__(self,
-                filepath: str) -> None:
+                filepath: str,
+                verify: bool = False) -> None:
         """
         Describe an archive file.
         :param filepath: path to archive
@@ -75,14 +124,17 @@ class File():
         :param create_subdir: whether or not to create directory named
         from the archive name, without extension
         """
-        self.path = Path(filepath)
+        self.path: Path = Path(filepath)
         self._mimetype: Optional[str] = None
         self._ext: Optional[str] = None
         self._handlers: Optional[list] = None
         self._used_unreliable: bool = False
         self.dest_dir: Optional[Path] = None
-        self.handler: Handler = next(self.handlers)
+        self._gen_handler: Generator 
+        # This may raise StopIteration if the handler list is empty!
+        self.handler: Handler = next(self.handlers)()
         self.password: Optional[str] = None
+        self.force_verification: bool = verify
 
     def exists(self) -> bool:
         return self.path.exists()
@@ -103,14 +155,18 @@ class File():
                 and "inode/directory" in self._mimetype:
                     raise Exception("Not a valid archive file.")
                 self._handlers = ext_to_extractor['*']
-        return (h() for h in self._handlers)
+            # self._handlers.append(None)
+            self._gen_handler = (h for h in self._handlers)
+        return self._gen_handler
 
     @property
     def mimetype(self) -> Optional[str]:
         if self._mimetype is None:
             mime = guess_type(self.path)
+            log.debug(f"Guessed type: {mime}")
             if mime[0] is None:
                 mime, _ext = get_mimetype(self.path)
+                log.debug(f"get_mimetype()-> {mime}, {_ext}")
                 self._mimetype = mime
                 if _ext is None:
                     _ext = get_ext(mime)
@@ -156,7 +212,7 @@ class File():
                     create_subdir=create_subdir,
                     exclude=exclude
                 )
-                return
+                break
             except FileCreationError as e:
                 # if not e.problematic_filenames:
                 # TODO get bad filenames by other means (-test flag) if empty
@@ -179,19 +235,50 @@ class File():
                         create_subdir=create_subdir,  # not really used
                         password=pfile.password
                     )
-                return
+                break
             except CanceledPasswordPrompt:
                 log.warning(f"We have skipped password prompt for file {self.path}")
-                return
+                raise
             except Exception as e:
                 play_sound("WARNING")
                 log.exception(e)
                 log.debug(f"Trying next handler for {self}...")
-                self.handler = next(self.handlers)
+                self.handler = next(self.handlers)()
+
+        if self._used_unreliable or self.force_verification:
+        # Compare extracted files to files listed by extractor
+            if self.dest_dir is None \
+            or self.dest_dir == self.path.absolute().parent:
+                log.debug(f"{self} had no specified destination directory. "
+                            "Skipping verification of extracted files.")
+                return
+
+            log.debug("Checking number of entries in archive...")
+            log.debug(f"arfile {self} has password: {self.password}")
+            arentries = self.list_files(self.password)
+            log.debug(f"Number of entries found {len(arentries)}: {arentries}")
+
+            log.debug("Checking number of entries in output directory...")
+            fsentries = enumerate_extracted_files(self.dest_dir)
+            diff_count = len(arentries) - len(fsentries)
+            if diff_count != 0:
+                fs_missing_files = \
+                    [f for f in arentries if f not in fsentries]
+                log.warning(
+                    f"{diff_count.__abs__()} files might be missing from disk "
+                    "after extraction, or they had to be renamed slightly: "
+                    f"{fs_missing_files}"
+                )
+            else:
+                log.debug(
+                    "Number of files on disk matches number of files "
+                    f"reported in archive by extractor {self.handler.__class__}")
+
 
     def list_files(self, password: Optional[str] = None) -> list:
         files = []
         while True:
+            print("Listing files...")
             try:
                 files = self.handler.list_files(
                     target=self.path,
@@ -199,7 +286,7 @@ class File():
                 )
                 return files
             except:
-                self.handler = next(self.handlers)
+                self.handler = next(self.handlers)()
 
     def print_file(self,
                    filename: ArchiveEntry,
@@ -219,4 +306,19 @@ class File():
                 )
                 return
             except:
-                self.handler = next(self.handlers)
+                self.handler = next(self.handlers)()
+
+
+def enumerate_extracted_files(
+    destdir: Path,
+    ) -> list[ArchiveEntry]:
+    """Return a list of paths to files relative to destdir."""
+    if not destdir.is_dir():
+        raise Exception(f"{destdir} is not a valid directory.")
+
+    out_file_listing = []
+    for _root, _, _files in walk(destdir):
+        for f in _files:
+            out_file_listing.append(ArchiveEntry(f, [_root]))
+    log.debug(f"Files on disk: {out_file_listing}")
+    return out_file_listing
